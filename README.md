@@ -59,8 +59,6 @@ What `build_application.py` does:
 
 ## How It Works
 
-## High-Level Pipeline
-
 Each frame follows this order:
 1. Decode frame from input.
 2. Pre-White balance (temperature + tint).
@@ -69,7 +67,7 @@ Each frame follows this order:
 5. Display in preview and scopes.
 6. For export: encode processed frames to output file.
 
-## Core Transform Model
+Core Transform Model
 
 The transform takes white-balanced channels and computes CIR-like output channels:
 - `Y` (IR-derived channel)
@@ -83,7 +81,7 @@ Control groups:
 
 This gives fine control over foliage response, channel separation, saturation behavior, and highlight rolloff.
 
-## Preview Bit-Depth
+Preview Bit-Depth
 
 Preview has a depth selector:
 - `8-bit` preview: OpenCV decode path.
@@ -91,7 +89,7 @@ Preview has a depth selector:
 
 This affects preview only. Export settings are independent.
 
-## Compute Backends
+Compute Backends
 
 Compute selector:
 - `Auto`
@@ -104,10 +102,21 @@ Backend behavior:
 - GPU: prefers GPU (Metal (macOS)), or CuPy (Windows) if available.
 - Fallback remains functional with NumPy.
 
-## White Balance
+Queue Editing Behavior
+
+Queue includes:
+- Add to Queue
+- Update to Queue (appears when current clip already exists in queue)
+- Remove Queue
+- Move Up / Move Down
+
+Double-click behavior:
+- Double-click a queue item to reload that clip and its saved settings for re-editing.
+
+White Balance
 White Balance does not behave traditionally in this program. It is used to balance the 3 channels for effective IR Subtraction - the WB is done BEFORE Subtraction. If the WB is incorrectly set the quality of the subtraction deteriorates. When using WB you can use the WB reference button to pick a section of the image to automatically set WB settings. From there you can move onto Fraction Sliders. Once Happy, readjust WB to refine overall effect
 
-## Fractions Sliders
+Fractions Sliders
 
 Fraction sliders tell the Transform Engine how much Visible to IR there is per channel, which determines how much subtraction takes place and subsequently, how much saturation is naturally increased:
 - Higher Visible Fraction means there is more Visible Light than there is IR light (Weaker Subtraction)
@@ -123,7 +132,7 @@ Note: Notice in the scatterplots how the relationship between Visible vs IR is s
 
 Important: Too aggressive on the Fraction sliders will result in artifacts in highlights - use with discretion
 
-## Gamma & Exposure
+Gamma & Exposure
 
 The Gamma's can be split into 2 sections: Gamma Visible and Gamma IR
 
@@ -156,10 +165,11 @@ Suggested approach:
 
 <img width="2904" height="2172" alt="Screenshot 2026-02-15 at 11 49 36 AM" src="https://github.com/user-attachments/assets/652372ae-6ce2-4d1b-8434-9c6489e1b809" />
 
+IMPORTANT: Exposure should only be used to view changes across the scene: Shadow areas and Highlights. It is best practice to reset exposure to 1.0 for export
 
-## How To Use (Detailed)
+## How To Use in order
 
-## Recommended Workflow
+Recommended Workflow
 
 1. Open a clip.
 2. Pick `Preview Quality`, `Compute`, and `Preview Depth`.
@@ -173,28 +183,17 @@ Suggested approach:
 10. Repeat for more clips.
 11. Convert queue.
 
-## Queue Editing Behavior
-
-Queue includes:
-- Add to Queue
-- Update to Queue (appears when current clip already exists in queue)
-- Remove Queue
-- Move Up / Move Down
-
-Double-click behavior:
-- Double-click a queue item to reload that clip and its saved settings for re-editing.
-
 ## Technical: Import and Export (Decode/Encode)
 
 This section is for video editors and technical users.
 
-## Input / Import
+Input / Import
 
 - Metadata is probed from source (frame count, fps, dimensions, pixel format, bit depth class, color metadata when available).
 - Preview timeline uses frame decoding for interactive viewing.
 - Preview can use 8-bit or 10-bit decode mode as selected in UI.
 
-## Export / Encode
+Export / Encode
 
 Preferred export path:
 - ffmpeg decode -> process in float32 -> ffmpeg encode.
@@ -215,20 +214,20 @@ Practical output intent:
 - Preserve audio when possible.
 - Preserve source bit-depth class when supported by selected encode path.
 
-## Important Note
+Important Note
 
 Preview depth does not force export depth.
 Export depth is decided by conversion/export pipeline rules.
 
 ## Troubleshooting
 
-## Setup Script Opens Then Fails
+Setup Script Opens Then Fails
 
 - Ensure Python from python.org is installed.
 - Re-run `setup.py` with Python Launcher.
 - If prompted for password during package/system installs on macOS, this is normal.
 
-## ffmpeg Not Found
+ffmpeg Not Found
 
 - Run `setup.py` again.
 - Verify `ffmpeg` exists in Terminal:
@@ -238,13 +237,13 @@ ffmpeg -version
 ffprobe -version
 ```
 
-## Preview Looks Blocky On High-Bit-Depth Footage
+Preview Looks Blocky On High-Bit-Depth Footage
 
 - Switch `Preview Depth` to `10-bit`.
 - If ffmpeg is missing, install it (setup script handles this).
 - Set `Preview Quality` to `Balanced` or `Full`.
 
-## Conversion Progress Seems Stuck
+Conversion Progress Seems Stuck
 
 - Let conversion continue for a moment under heavy system load.
 - The status/log path is asynchronous and may briefly lag on busy systems.
@@ -252,18 +251,18 @@ ffprobe -version
 
 Note: Do not panic if the Progress Bar freezes, conversion continues
 
-## Output Has Audio But No Video (or unreadable in some players)
+Output Has Audio But No Video (or unreadable in some players)
 
 - Re-run using ffmpeg path (not fallback).
 - Verify source codec compatibility and try another container/target codec if needed.
 - Test output in multiple players (QuickTime, VLC, Resolve) to isolate player-specific behavior.
 
-## GPU Mode Issues
+GPU Mode Issues
 
 - On macOS, `GPU` mode uses Metal path when available.
 - If GPU backend is unstable on a system, switch to `CPU` or `Auto`.
 
-## Project Files (Current Folder)
+Project Files (Current Folder)
 
 Main runtime files:
 - `PyChromeSuper35.py` (GUI entry + orchestration)
@@ -279,5 +278,6 @@ Main runtime files:
 - `build_release.py` (packaging pipeline)
 
 ## License
+MIT
 
 MIT
