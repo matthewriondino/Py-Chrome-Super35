@@ -33,6 +33,8 @@ For users who do not code and just want to run the app from source:
 5. Close Terminal.
 6. Right-click `PyChromeSuper35.py` and choose `Open With` -> `Python Launcher`.
 
+<img width="945" height="783" alt="Screenshot 2026-02-15 at 12 11 48 PM" src="https://github.com/user-attachments/assets/74fbdd3b-775a-4c81-8f2a-8933937a6747" />
+
 What `setup.py` does:
 - Installs required Python packages.
 - Installs ffmpeg (and Homebrew first on macOS if needed).
@@ -49,6 +51,8 @@ To build a standalone application package:
 4. Wait for build to complete (Terminal will show progress).
 5. Close Terminal.
 6. A folder will be created called "Release", the application "PyChromeSuper35" will be made ready to run
+
+<img width="921" height="717" alt="Screenshot 2026-02-15 at 12 12 45 PM" src="https://github.com/user-attachments/assets/bc08bf59-8cdf-4dfa-8847-a9fb87846779" />
 
 What `build_application.py` does:
 - Installs required Python packages.
@@ -278,6 +282,4 @@ Main runtime files:
 - `build_release.py` (packaging pipeline)
 
 ## License
-MIT
-
 MIT
