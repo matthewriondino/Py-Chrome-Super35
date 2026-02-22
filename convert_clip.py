@@ -144,6 +144,62 @@ PROCESSED_LOG_MIN_INTERVAL_S = max(0.03, float(os.getenv("PYCHROME_PROCESSED_LOG
 EMIT_FFMPEG_PROGRESS = os.getenv("PYCHROME_EMIT_FFMPEG_PROGRESS", "0").strip().lower() in {
     "1", "true", "yes", "on"
 }
+CONVERTER_TRACE_MODE = str(os.getenv("PYCHROME_CONVERTER_TRACE_MODE", "")).strip().lower()
+if CONVERTER_TRACE_MODE not in {"off", "sample", "full"}:
+    _legacy_trace = os.getenv("PYCHROME_CONVERTER_TRACE", "0").strip().lower() in {"1", "true", "yes", "on"}
+    CONVERTER_TRACE_MODE = "full" if _legacy_trace else "off"
+CONVERTER_TRACE_ENABLED = CONVERTER_TRACE_MODE != "off"
+CONVERTER_TRACE_PATH = (os.getenv("PYCHROME_CONVERTER_TRACE_PATH", "") or "").strip() or None
+CONVERTER_TRACE_PROCESSED_STEP = max(1, int(os.getenv("PYCHROME_CONVERTER_TRACE_PROCESSED_STEP", "200")))
+_TRACE_LOCK = threading.Lock()
+_TRACE_STARTED = False
+
+
+def _conv_trace(msg):
+    global _TRACE_STARTED
+    if not CONVERTER_TRACE_ENABLED or not CONVERTER_TRACE_PATH:
+        return
+    try:
+        p = Path(CONVERTER_TRACE_PATH)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        wall = time.time()
+        mono = time.monotonic()
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(wall))
+        ms = int((wall - int(wall)) * 1000.0)
+        tid = threading.current_thread().name
+        text = str(msg)
+        if CONVERTER_TRACE_MODE == "sample":
+            low = text.lower()
+            if text.startswith("processed="):
+                pass
+            elif not any(
+                k in low
+                for k in (
+                    "start",
+                    "done",
+                    "error",
+                    "exit",
+                    "active_backend",
+                    "job",
+                    "batch",
+                    "main args",
+                    "main exit",
+                )
+            ):
+                return
+        with _TRACE_LOCK:
+            with open(p, "a", encoding="utf-8") as f:
+                if not _TRACE_STARTED:
+                    f.write("PyChromeSuper35 converter trace\n")
+                    f.write(f"pid: {os.getpid()}\n")
+                    f.write(f"python: {sys.executable}\n")
+                    f.write(f"cwd: {os.getcwd()}\n")
+                    f.write(f"trace_mode: {CONVERTER_TRACE_MODE}\n")
+                    f.write("\n")
+                    _TRACE_STARTED = True
+                f.write(f"{ts}.{ms:03d} mono={mono:12.3f} th={tid:<18} {text}\n")
+    except Exception:
+        pass
 
 def _emit_processed_progress(i, state, force=False):
     now = time.monotonic()
@@ -151,6 +207,8 @@ def _emit_processed_progress(i, state, force=False):
     last_t = float(state.get("t", 0.0))
     if force or last_i <= 0 or (i - last_i) >= PROCESSED_LOG_EVERY_FRAMES or (now - last_t) >= PROCESSED_LOG_MIN_INTERVAL_S:
         print(f"PROCESSED: {i}", flush=True)
+        if force or (i % CONVERTER_TRACE_PROCESSED_STEP == 0):
+            _conv_trace(f"processed={i}")
         state["i"] = int(i)
         state["t"] = now
 
@@ -400,6 +458,7 @@ def _read_exact_binary(stream, size):
     return b"".join(parts)
 
 def process_and_encode_with_ffmpeg(input_path, preset, output_path, ffmpeg_cmd_path, backend="auto"):
+    _conv_trace(f"process_and_encode start input={input_path} output={output_path} backend_req={backend}")
     meta = probe_input_metadata(input_path, ffmpeg_path=ffmpeg_cmd_path)
     frame_count = int(meta.get("frame_count") or 0)
     fps = float(meta.get("fps") or 25.0)
@@ -418,6 +477,12 @@ def process_and_encode_with_ffmpeg(input_path, preset, output_path, ffmpeg_cmd_p
         print(f"INPUT_PIX_FMT: {meta['pix_fmt']}", flush=True)
 
     encode = _choose_output_encode_settings(meta)
+    _conv_trace(
+        "meta "
+        + f"frames={frame_count} fps={fps:.6f} size={width}x{height} "
+        + f"input_bit_depth={int(meta.get('bit_depth') or 8)} input_pix_fmt={meta.get('pix_fmt')} "
+        + f"output_bit_depth={encode['target_bit_depth']} output_pix_fmt={encode['output_pix_fmt']} codec={encode['codec']}"
+    )
     print(f"OUTPUT_BIT_DEPTH: {encode['target_bit_depth']}", flush=True)
     print(f"OUTPUT_PIX_FMT: {encode['output_pix_fmt']}", flush=True)
     out_tag = _output_codec_tag(encode["codec"])
@@ -575,6 +640,7 @@ def process_and_encode_with_ffmpeg(input_path, preset, output_path, ffmpeg_cmd_p
             out = processor.process(rgb, params)
             if not backend_logged:
                 print(f"COMPUTE_BACKEND_ACTIVE: {processor.active_backend}", flush=True)
+                _conv_trace(f"active_backend={processor.active_backend}")
                 backend_logged = True
 
             if encode["target_bit_depth"] >= 10:
@@ -640,7 +706,9 @@ def process_and_encode_with_ffmpeg(input_path, preset, output_path, ffmpeg_cmd_p
         _emit_processed_progress(i, progress_state, force=True)
     if not backend_logged:
         print(f"COMPUTE_BACKEND_ACTIVE: {processor.active_backend}", flush=True)
+        _conv_trace(f"active_backend={processor.active_backend}")
     print(f"Finished processing frames: {i}", flush=True)
+    _conv_trace(f"process_and_encode done frames={i} decoder_code={decoder_code} encoder_code={code}")
     return fps, i, (width, height)
 
 def process_job_frames(input_path, preset, tmp_out_dir, backend='auto'):
@@ -806,6 +874,7 @@ def write_video_with_opencv(input_path, preset, output_path, backend='numpy'):
     return fps, i
 
 def run_job(job_index, inp, outp, preset, ffmpeg_path=None, backend='auto'):
+    _conv_trace(f"run_job start index={job_index} input={inp} output={outp} ffmpeg_path={ffmpeg_path} backend={backend}")
     print(f"JOB_START: {job_index} {inp} -> {outp}", flush=True)
     if ffmpeg_path:
         try:
@@ -814,21 +883,26 @@ def run_job(job_index, inp, outp, preset, ffmpeg_path=None, backend='auto'):
             )
             print(f"Frames written: {frames_written}, fps: {fps}, size: {size}", flush=True)
             print(f"JOB_DONE: {job_index} 0", flush=True)
+            _conv_trace(f"run_job done index={job_index} ok frames={frames_written}")
         except Exception as e:
             print(f"JOB_DONE: {job_index} 1", flush=True)
             print(f"ERROR: ffmpeg encode path failed: {e}", flush=True)
+            _conv_trace(f"run_job error index={job_index} ffmpeg_path error={e}")
             raise
     else:
         try:
             fps_w, frames_written_w = write_video_with_opencv(inp, preset, outp, backend=backend)
             print(f"Frames written: {frames_written_w}, fps: {fps_w}", flush=True)
             print(f"JOB_DONE: {job_index} 0", flush=True)
+            _conv_trace(f"run_job done index={job_index} fallback_ok frames={frames_written_w}")
         except Exception as e:
             print(f"JOB_DONE: {job_index} 1", flush=True)
             print(f"ERROR: OpenCV fallback failed: {e}", flush=True)
+            _conv_trace(f"run_job error index={job_index} fallback error={e}")
             raise
 
 def run_batch(batch_path, ffmpeg_path=None, backend='auto'):
+    _conv_trace(f"run_batch start batch_path={batch_path} ffmpeg_path={ffmpeg_path} backend={backend}")
     with open(batch_path, "r", encoding="utf-8") as f:
         batch = json.load(f)
     jobs = batch.get("jobs", [])
@@ -841,6 +915,7 @@ def run_batch(batch_path, ffmpeg_path=None, backend='auto'):
     backend = normalize_backend_request(backend)
     print("BACKEND_REQUESTED: " + backend, flush=True)
     ffmpeg_resolved = _find_ffmpeg_candidates(ffmpeg_path)
+    _conv_trace(f"run_batch resolved ffmpeg={ffmpeg_resolved} jobs={len(jobs)} backend={backend}")
     if ffmpeg_resolved: print("FFMPEG: found -> " + str(ffmpeg_resolved), flush=True)
     else: print("FFMPEG: not found; will fallback to OpenCV (audio dropped)", flush=True)
     for idx, j in enumerate(jobs):
@@ -854,10 +929,17 @@ def run_batch(batch_path, ffmpeg_path=None, backend='auto'):
         except Exception as e:
             print(f"JOB_DONE: {idx} 1", flush=True)
             print(f"ERROR: job {idx} failed: {e}", flush=True)
+            _conv_trace(f"run_batch job_error index={idx} error={e}")
             continue
-    print("BATCH_DONE", flush=True); return 0
+    print("BATCH_DONE", flush=True)
+    _conv_trace("run_batch done")
+    return 0
 
 def run_single_mode(input_path, preset_path, output_path, ffmpeg_path=None, backend='auto'):
+    _conv_trace(
+        "run_single start "
+        + f"input={input_path} preset={preset_path} output={output_path} ffmpeg_path={ffmpeg_path} backend={backend}"
+    )
     if not os.path.exists(input_path): print("Input not found: " + input_path, flush=True); return 2
     if not os.path.exists(preset_path): print("Preset not found: " + preset_path, flush=True); return 2
     with open(preset_path, "r", encoding="utf-8") as f: preset = json.load(f)
@@ -866,8 +948,10 @@ def run_single_mode(input_path, preset_path, output_path, ffmpeg_path=None, back
     print("BACKEND_REQUESTED: " + backend, flush=True)
     try:
         run_job(0, input_path, output_path, preset, ffmpeg_path=ffmpeg_resolved, backend=backend)
+        _conv_trace("run_single done")
         return 0
     except Exception as e:
+        _conv_trace(f"run_single error={e}")
         print("Conversion failed: " + str(e), flush=True); return 1
 
 def main():
@@ -885,15 +969,18 @@ def main():
         help="Processing backend (gpu prefers Metal then CuPy; cupy is explicit CuPy request)",
     )
     args = ap.parse_args()
+    _conv_trace(f"main args={sys.argv[1:]}")
 
     if args.batch:
         if not os.path.exists(args.batch): print("Batch JSON not found: " + args.batch, flush=True); sys.exit(2)
         code = run_batch(args.batch, ffmpeg_path=args.ffmpeg_path, backend=args.backend)
+        _conv_trace(f"main exit code={code}")
         sys.exit(code)
     else:
         if not (args.input and args.preset and args.output):
             print("Single-mode requires --input --preset --output (or use --batch)", flush=True); ap.print_help(); sys.exit(2)
         code = run_single_mode(args.input, args.preset, args.output, ffmpeg_path=args.ffmpeg_path, backend=args.backend)
+        _conv_trace(f"main exit code={code}")
         sys.exit(code)
 
 if __name__ == "__main__":

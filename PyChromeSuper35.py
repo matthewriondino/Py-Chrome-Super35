@@ -14,6 +14,7 @@ import sys
 import math
 import json
 import tempfile
+import atexit
 import threading
 import subprocess
 import shutil
@@ -203,7 +204,6 @@ _SCATTER_RNG = np.random.default_rng()
 queue_items = []  # each item: dict {id,label,input,output,preset}
 
 # converter communication
-_conv_queue = None
 _conv_raw_queue = None
 _convert_thread = None
 _conv_worker_thread = None
@@ -217,41 +217,48 @@ _conv_ui_applied_rev = -1
 _conv_ui_last_log_push_ts = 0.0
 _conv_ui_heartbeat_running = False
 _conv_success_autoclose_queued = False
-_conv_status_pipeline = str(os.getenv("PYCHROME_STATUS_PIPELINE", "v2")).strip().lower()
-if _conv_status_pipeline not in {"v1", "v2"}:
-    _conv_status_pipeline = "v2"
+_conv_status_pipeline = "v2"
 _conv_status_debug = str(os.getenv("PYCHROME_STATUS_DEBUG", "0")).strip().lower() in {"1", "true", "yes", "on"}
+_conv_status_preview_policy = str(os.getenv("PYCHROME_STATUS_PREVIEW_POLICY", "status_priority")).strip().lower()
+if _conv_status_preview_policy not in {"status_priority", "balanced"}:
+    _conv_status_preview_policy = "status_priority"
 
 # per-batch tracking (for modal)
-_conv_current_job_index = None
-_conv_current_job_total = None
-_conv_current_job_processed = None
-_conv_total_jobs = 0
-_conv_done_jobs = 0
-_conv_current_job_stage = 0.0
-_conv_duration_ms = None
-_conv_job_frame_frac = 0.0
-_conv_job_encode_frac = 0.0
-_conv_last_status_update = 0.0
-_conv_log_lines = deque(maxlen=400)
-_conv_log_last_ui_push = 0.0
-_conv_poll_frame_step = 1
-_conv_poll_max_items = 240
-_conv_log_processed_step = 20
-_conv_last_logged_processed = 0
-_conv_poll_last_ts = 0.0
-_conv_render_poll_min_interval_s = 0.02
-_conv_use_render_tick = False
-_conv_render_heartbeat_min_interval_s = 0.06
-_conv_render_last_heartbeat_ts = 0.0
 _ui_heartbeat_frame_step = 2
-_ui_heartbeat_stale_poll_s = 0.20
 _conv_stall_warn_after_s = 1.0
 _conv_status_log_max_lines = 300
 _conv_status_log_every_frames = 20
 _conv_status_log_min_interval_s = 0.5
-_conv_status_log_ui_interval_s = 0.35
+_conv_status_log_ui_interval_idle_s = 0.30
+_conv_status_log_ui_interval_convert_s = 1.00
 _conv_raw_queue_maxsize = 4096
+_conv_trace_mode = str(os.getenv("PYCHROME_STATUS_TRACE_MODE", "")).strip().lower()
+if _conv_trace_mode not in {"off", "sample", "full"}:
+    _trace_legacy_on = str(os.getenv("PYCHROME_STATUS_TRACE", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    _conv_trace_mode = "full" if _trace_legacy_on else "off"
+_conv_trace_enabled = _conv_trace_mode != "off"
+_conv_trace_sample_processed_step = max(1, int(os.getenv("PYCHROME_STATUS_TRACE_PROCESSED_STEP", "100")))
+_conv_trace_path = None
+_conv_trace_lock = threading.Lock()
+_conv_trace_queue = None
+_conv_trace_writer_thread = None
+_conv_trace_stop_event = None
+_conv_trace_queue_maxsize = 8192
+_conv_trace_drop_count = 0
+_conv_trace_last_worker_batch_ts = 0.0
+_conv_trace_last_snapshot_log_ts = 0.0
+_conv_trace_last_ui_apply_log_ts = 0.0
+_conv_trace_last_ui_heartbeat_log_ts = 0.0
+_conv_trace_last_ui_stale_log_ts = 0.0
+_conv_ui_last_heartbeat_ts = 0.0
+_conv_ui_last_apply_ts = 0.0
+_conv_ui_heartbeat_seq = 0
+_conv_ui_force_apply_after_s = 1.5
+_conv_ui_stall_warn_cooldown_s = 5.0
+_ui_heartbeat_non_status_budget_s_idle = 0.02
+_ui_heartbeat_non_status_budget_s_convert = 0.006 if _conv_status_preview_policy == "status_priority" else 0.02
+_conv_converter_trace_path = None
+_ui_manual_heartbeat_mode = True
 
 # Preview redraw coalescing
 _preview_update_scheduled = False
@@ -259,6 +266,8 @@ _preview_update_dirty = False
 _preview_last_update_ts = 0.0
 _preview_min_interval_s = 1.0 / 30.0
 _preview_min_interval_during_convert_s = 1.0 / 10.0
+if _conv_status_preview_policy == "status_priority":
+    _preview_min_interval_during_convert_s = max(_preview_min_interval_during_convert_s, 1.0 / 3.0)
 _last_warning_text = None
 _preview_processor = None
 _preview_processor_request = None
@@ -282,6 +291,183 @@ _lut_size = 0
 _lut_flat = None
 _lut_domain_min = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 _lut_domain_max = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+
+# ----------------------------
+# Status trace logging (debug)
+# ----------------------------
+def _status_trace_writer_loop(path, q, stop_event):
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            while True:
+                if stop_event.is_set() and q.empty():
+                    break
+                try:
+                    line = q.get(timeout=0.20)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    break
+                f.write(line)
+            while True:
+                try:
+                    line = q.get_nowait()
+                except queue.Empty:
+                    break
+                if line is None:
+                    break
+                f.write(line)
+    except Exception:
+        pass
+
+
+def _stop_status_trace_writer():
+    global _conv_trace_queue, _conv_trace_writer_thread, _conv_trace_stop_event, _conv_trace_drop_count
+    with _conv_trace_lock:
+        q = _conv_trace_queue
+        th = _conv_trace_writer_thread
+        stop_event = _conv_trace_stop_event
+        dropped = int(_conv_trace_drop_count)
+        _conv_trace_queue = None
+        _conv_trace_writer_thread = None
+        _conv_trace_stop_event = None
+        _conv_trace_drop_count = 0
+    if q is None:
+        return
+    if dropped > 0:
+        try:
+            q.put_nowait(f"[trace] dropped {dropped} trace lines due to queue pressure\n")
+        except Exception:
+            pass
+    try:
+        q.put_nowait(None)
+    except Exception:
+        pass
+    try:
+        if stop_event is not None:
+            stop_event.set()
+    except Exception:
+        pass
+    try:
+        if th is not None and th.is_alive():
+            th.join(timeout=1.0)
+    except Exception:
+        pass
+
+
+def _start_status_trace_writer(path, header_lines=None):
+    global _conv_trace_queue, _conv_trace_writer_thread, _conv_trace_stop_event, _conv_trace_drop_count
+    _stop_status_trace_writer()
+    if not path or not _conv_trace_enabled:
+        return
+    if header_lines is None:
+        header_lines = []
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            for line in header_lines:
+                f.write(str(line).rstrip("\n") + "\n")
+            f.write("\n")
+    except Exception:
+        return
+    q = queue.Queue(maxsize=max(256, int(_conv_trace_queue_maxsize)))
+    stop_event = threading.Event()
+    th = threading.Thread(
+        target=_status_trace_writer_loop,
+        args=(path, q, stop_event),
+        daemon=True,
+        name="status-trace-writer",
+    )
+    with _conv_trace_lock:
+        _conv_trace_queue = q
+        _conv_trace_writer_thread = th
+        _conv_trace_stop_event = stop_event
+        _conv_trace_drop_count = 0
+    th.start()
+
+
+def _status_trace(msg):
+    if not _conv_trace_enabled:
+        return
+    q = _conv_trace_queue
+    if q is None:
+        return
+    text = str(msg)
+    if _conv_trace_mode == "sample":
+        if text.startswith(("ui heartbeat", "snapshot ", "ui apply", "render tick", "status worker batch size")):
+            return
+    try:
+        wall = time.time()
+        mono = time.monotonic()
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(wall))
+        ms = int((wall - int(wall)) * 1000.0)
+        th = threading.current_thread().name
+        line = f"{ts}.{ms:03d} mono={mono:12.3f} th={th:<18} {text}\n"
+        q.put_nowait(line)
+    except queue.Full:
+        with _conv_trace_lock:
+            _conv_trace_drop_count += 1
+    except Exception:
+        pass
+
+
+def _init_status_trace(total_jobs=0, cmd=None):
+    global _conv_trace_path, _conv_trace_last_worker_batch_ts, _conv_trace_last_snapshot_log_ts
+    global _conv_trace_last_ui_apply_log_ts, _conv_trace_last_ui_heartbeat_log_ts
+    global _conv_trace_last_ui_stale_log_ts, _conv_ui_last_heartbeat_ts, _conv_converter_trace_path
+    global _conv_ui_last_apply_ts
+    _conv_trace_path = None
+    _conv_trace_last_worker_batch_ts = 0.0
+    _conv_trace_last_snapshot_log_ts = 0.0
+    _conv_trace_last_ui_apply_log_ts = 0.0
+    _conv_trace_last_ui_heartbeat_log_ts = 0.0
+    _conv_trace_last_ui_stale_log_ts = 0.0
+    _conv_ui_last_heartbeat_ts = time.monotonic()
+    _conv_ui_last_apply_ts = _conv_ui_last_heartbeat_ts
+    _conv_converter_trace_path = None
+    _stop_status_trace_writer()
+    if not _conv_trace_enabled:
+        return None
+    try:
+        log_dir = Path(_app_user_data_dir()) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        log_dir = Path(tempfile.gettempdir()) / "pychromesuper35_logs"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return None
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    suffix = uuid.uuid4().hex[:8]
+    path = log_dir / f"status_trace_{stamp}_{suffix}.log"
+    _conv_converter_trace_path = str(log_dir / f"converter_trace_{stamp}_{suffix}.log")
+    _conv_trace_path = str(path)
+    _start_status_trace_writer(
+        _conv_trace_path,
+        header_lines=[
+            "PyChromeSuper35 status trace",
+            f"created: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"status_pipeline: {_conv_status_pipeline}",
+            f"status_debug: {_conv_status_debug}",
+            f"trace_mode: {_conv_trace_mode}",
+            f"preview_policy: {_conv_status_preview_policy}",
+            f"jobs: {int(total_jobs)}",
+            ("command: " + " ".join(str(x) for x in cmd)) if cmd else "",
+        ],
+    )
+    if _conv_trace_queue is None:
+        _conv_trace_path = None
+        return None
+    _status_trace("trace initialized")
+    _status_trace(f"converter trace path={_conv_converter_trace_path}")
+    return _conv_trace_path
+
+
+atexit.register(_stop_status_trace_writer)
+
+
+def _status_pipeline_active():
+    with _conv_state_lock:
+        st = _conv_state
+        return bool(st is not None and (bool(st.get("active")) or (not bool(st.get("done")))))
 
 # ----------------------------
 # Utilities
@@ -384,11 +570,10 @@ def _preview_target_dimensions():
 
 def _is_conversion_active():
     try:
-        if _conv_status_pipeline == "v2":
-            with _conv_state_lock:
-                st = _conv_state
-                if st is not None and bool(st.get("active")) and not bool(st.get("done")):
-                    return True
+        with _conv_state_lock:
+            st = _conv_state
+            if st is not None and bool(st.get("active")) and not bool(st.get("done")):
+                return True
     except Exception:
         pass
     try:
@@ -998,13 +1183,8 @@ def _schedule_preview_update():
         except Exception:
             pass
         return
-    try:
-        dpg.set_frame_callback(dpg.get_frame_count() + 1, _drain_preview_update)
-    except Exception:
-        # Fallback path if frame callbacks are temporarily unavailable.
-        _preview_update_scheduled = False
-        _preview_update_dirty = False
-        update_main_preview()
+    # Runtime draining is handled by the persistent UI heartbeat.
+    return
 
 def _drain_preview_update(sender=None, app_data=None):
     global _preview_update_scheduled, _preview_update_dirty, _preview_last_update_ts
@@ -1015,7 +1195,7 @@ def _drain_preview_update(sender=None, app_data=None):
     now = time.monotonic()
     min_interval = _preview_update_interval_s()
     if _preview_last_update_ts > 0.0 and (now - _preview_last_update_ts) < min_interval:
-        _schedule_preview_update()
+        # Keep dirty and wait for next heartbeat tick.
         return
 
     _preview_update_dirty = False
@@ -1025,7 +1205,8 @@ def _drain_preview_update(sender=None, app_data=None):
         _preview_last_update_ts = time.monotonic()
 
     if _preview_update_dirty:
-        _schedule_preview_update()
+        # New updates arrived while rendering; next heartbeat will pick them up.
+        return
     else:
         _preview_update_scheduled = False
 
@@ -1070,6 +1251,8 @@ def update_main_preview(sender=None, app_data=None):
     update_warnings()
     now = time.monotonic()
     converting = _is_conversion_active()
+    if converting and _conv_status_preview_policy == "status_priority":
+        return
     channel_min_interval = _channel_min_interval_during_convert_s if converting else _channel_min_interval_idle_s
     if (now - _channel_last_update_ts) >= float(channel_min_interval):
         update_channel_previews(out_preview)
@@ -1728,6 +1911,7 @@ def _resolve_converter_command(batch_path, ffmpeg_path=None):
 def _cleanup_convert_tmpdir():
     global _convert_tmpdir
     if _convert_tmpdir:
+        _status_trace(f"cleanup tmpdir: {_convert_tmpdir}")
         try:
             shutil.rmtree(_convert_tmpdir, ignore_errors=True)
         except Exception:
@@ -1789,11 +1973,14 @@ def _enqueue_status_line(q, line):
         q.put_nowait(txt)
         return
     except queue.Full:
+        _status_trace("raw queue full while enqueueing line")
         pass
     if _status_line_is_critical(txt):
         try:
             q.put(txt, timeout=0.05)
+            _status_trace("raw queue full; forced critical line enqueue with timeout")
         except Exception:
+            _status_trace("raw queue full; failed to enqueue critical line")
             pass
 
 def _enqueue_status_event(q, event):
@@ -1803,6 +1990,7 @@ def _enqueue_status_event(q, event):
         q.put_nowait(event)
         return
     except queue.Full:
+        _status_trace("raw queue full while enqueueing control event")
         pass
     # Prefer delivering terminal control events over older log lines.
     try:
@@ -1812,6 +2000,7 @@ def _enqueue_status_event(q, event):
     try:
         q.put_nowait(event)
     except Exception:
+        _status_trace("raw queue full; failed to enqueue control event after drop")
         pass
 
 def _conv_status_log_keep(kind, line, state):
@@ -1860,6 +2049,11 @@ def _set_status_text_locked(state, text):
     t = str(text)
     if state.get("status_text") != t:
         state["status_text"] = t
+
+def _set_backend_status_locked(state):
+    req = str(state.get("backend_requested") or "pending")
+    act = str(state.get("backend_active") or "pending")
+    state["backend_text"] = f"Backend: Requested={req} | Active={act}"
 
 def _current_status_progress_locked(state):
     total_jobs = int(state.get("total_jobs") or 0)
@@ -1945,6 +2139,7 @@ def _finish_status_state_locked(state, code=0, error_message=None):
 
 def _init_conv_state(total_jobs):
     global _conv_state, _conv_state_rev, _conv_ui_applied_rev, _conv_ui_last_log_push_ts
+    global _conv_ui_last_apply_ts, _conv_ui_heartbeat_seq
     now = time.monotonic()
     with _conv_state_lock:
         _conv_state = {
@@ -1962,6 +2157,9 @@ def _init_conv_state(total_jobs):
             "current_job_frame_frac": 0.0,
             "current_job_display_frac": 0.0,
             "status_text": f"Starting batch conversion ({int(total_jobs)} jobs)...",
+            "backend_requested": "pending",
+            "backend_active": "pending",
+            "backend_text": "Backend: Requested=pending | Active=pending",
             "log_lines": deque(maxlen=_conv_status_log_max_lines),
             "log_dirty": True,
             "last_event_ts": now,
@@ -1970,13 +2168,42 @@ def _init_conv_state(total_jobs):
             "preview_rebuild_pending": False,
             "last_processed_log_frame": 0,
             "last_processed_log_ts": 0.0,
+            "last_ui_apply_ts": now,
+            "last_ui_heartbeat_seq": 0,
+            "ui_stall_count": 0,
+            "ui_last_stall_warn_ts": 0.0,
         }
+        if _conv_trace_path:
+            _conv_state["log_lines"].append(f"[debug] status trace log: {_conv_trace_path}")
         _conv_state_rev = 1
         _conv_ui_applied_rev = -1
         _conv_ui_last_log_push_ts = 0.0
+        _conv_ui_last_apply_ts = now
+        _conv_ui_heartbeat_seq = 0
+    _status_trace(f"init conv state: jobs={int(total_jobs)}")
+
+
+def _status_note_ui_heartbeat(seq):
+    with _conv_state_lock:
+        st = _conv_state
+        if st is not None:
+            st["last_ui_heartbeat_seq"] = int(seq)
+
+
+def _status_note_ui_apply(seq):
+    global _conv_ui_last_apply_ts
+    now = time.monotonic()
+    _conv_ui_last_apply_ts = now
+    with _conv_state_lock:
+        st = _conv_state
+        if st is not None:
+            st["last_ui_apply_ts"] = now
+            st["last_ui_heartbeat_seq"] = int(seq)
+
 
 def _status_apply_event(event):
     global _conv_state_rev
+    trace_lines = []
     with _conv_state_lock:
         state = _conv_state
         if state is None:
@@ -1989,6 +2216,7 @@ def _status_apply_event(event):
 
         if isinstance(event, dict):
             etype = str(event.get("type") or "").upper()
+            trace_lines.append(f"status event dict: {etype}")
             if etype == "DONE":
                 code = int(event.get("code", 1))
                 _finish_status_state_locked(state, code=code, error_message=None if code == 0 else f"Conversion finished with exit code {code}")
@@ -2000,6 +2228,8 @@ def _status_apply_event(event):
             line = str(event).strip()
             if line:
                 kind, payload = _parse_progress_from_line_batch(line)
+                if kind in {"JOB_START", "TOTAL_FRAMES", "JOB_DONE", "BATCH_DONE", "BACKEND_REQUESTED", "COMPUTE_BACKEND_ACTIVE"}:
+                    trace_lines.append(f"status line parsed: {kind} payload={payload}")
                 keep_line = _conv_status_log_keep(kind, line, state)
                 if keep_line:
                     _append_status_log_locked(state, line)
@@ -2031,6 +2261,8 @@ def _status_apply_event(event):
                     except Exception:
                         p_now = None
                     if p_now is not None:
+                        if p_now % _conv_trace_sample_processed_step == 0:
+                            trace_lines.append(f"processed={p_now} total={state.get('current_job_total_frames')}")
                         state["job_active"] = True
                         state["current_job_processed_frames"] = max(int(state.get("current_job_processed_frames") or 0), p_now)
                         _update_frame_progress_locked(state)
@@ -2057,6 +2289,14 @@ def _status_apply_event(event):
                     changed = True
                 elif kind == "DURATION_MS":
                     changed = changed or False
+                elif kind == "BACKEND_REQUESTED":
+                    state["backend_requested"] = str(payload)
+                    _set_backend_status_locked(state)
+                    changed = True
+                elif kind == "COMPUTE_BACKEND_ACTIVE":
+                    state["backend_active"] = str(payload)
+                    _set_backend_status_locked(state)
+                    changed = True
                 elif kind in {"FFMPEG_PROGRESS", "FFMPEG_KV"}:
                     changed = changed or False
                 else:
@@ -2082,21 +2322,31 @@ def _status_apply_event(event):
 
         if changed:
             _conv_state_rev += 1
+    for line in trace_lines:
+        _status_trace(line)
 
 def _status_worker_loop():
-    global _conv_raw_queue, _conv_worker_thread, _conv_state_rev
+    global _conv_raw_queue, _conv_worker_thread, _conv_state_rev, _conv_trace_last_worker_batch_ts
+    global _conv_trace_last_ui_stale_log_ts
+    _status_trace("status worker start")
     stop_after_item = False
     while True:
         q = _conv_raw_queue
         if q is None:
+            _status_trace("status worker exit: raw queue missing")
+            _stop_status_trace_writer()
             return
         try:
             item = q.get(timeout=0.1)
         except queue.Empty:
+            done_and_inactive = False
             with _conv_state_lock:
                 st = _conv_state
                 if st is not None and bool(st.get("done")) and not bool(st.get("active")):
-                    break
+                    done_and_inactive = True
+            if done_and_inactive:
+                _status_trace("status worker exit: state done and inactive")
+                break
             continue
         batch = [item]
         for _ in range(127):
@@ -2104,6 +2354,14 @@ def _status_worker_loop():
                 batch.append(q.get_nowait())
             except queue.Empty:
                 break
+        now = time.monotonic()
+        if (now - float(_conv_trace_last_worker_batch_ts)) >= 0.5:
+            _status_trace(f"status worker batch size={len(batch)}")
+            _conv_trace_last_worker_batch_ts = now
+        if _conv_ui_last_heartbeat_ts > 0.0 and (now - float(_conv_ui_last_heartbeat_ts)) > 2.5:
+            if (now - float(_conv_trace_last_ui_stale_log_ts)) >= 5.0:
+                _status_trace(f"ui heartbeat stale for {now - float(_conv_ui_last_heartbeat_ts):.3f}s while worker active")
+                _conv_trace_last_ui_stale_log_ts = now
         for item in batch:
             try:
                 _status_apply_event(item)
@@ -2117,51 +2375,100 @@ def _status_worker_loop():
                 stop_after_item = True
                 break
         if stop_after_item:
+            _status_trace("status worker stopping after terminal event")
             break
     _cleanup_convert_tmpdir()
     _conv_raw_queue = None
     _conv_worker_thread = None
+    _status_trace("status worker end")
+    _stop_status_trace_writer()
 
 def _schedule_ui_heartbeat():
+    if _ui_manual_heartbeat_mode:
+        return True
     try:
         dpg.set_frame_callback(dpg.get_frame_count() + int(_ui_heartbeat_frame_step), _ui_heartbeat)
         return True
-    except Exception:
+    except Exception as e:
+        _status_trace(f"schedule ui heartbeat failed: {e}")
         return False
 
 def _status_snapshot():
-    global _conv_ui_last_log_push_ts, _conv_state_rev
+    global _conv_ui_last_log_push_ts, _conv_state_rev, _conv_trace_last_snapshot_log_ts
+    trace_lines = []
+    log_text_lines = None
+    snapshot = None
+    trace_snapshot = None
     with _conv_state_lock:
         st = _conv_state
         if st is None:
             return None
 
         now = time.monotonic()
-        if bool(st.get("active")) and not bool(st.get("done")):
+        active = bool(st.get("active"))
+        done = bool(st.get("done"))
+        if active and not done:
             if (now - float(st.get("last_event_ts") or 0.0)) > float(_conv_stall_warn_after_s) and not bool(st.get("stall_warned")):
                 st["stall_warned"] = True
                 _append_status_log_locked(st, "[warn] status stream stalled; waiting for converter output...")
                 _conv_state_rev += 1
+                trace_lines.append("stall warning triggered")
+            last_ui_apply_ts = float(st.get("last_ui_apply_ts") or 0.0)
+            if last_ui_apply_ts > 0.0 and (now - last_ui_apply_ts) > float(_conv_ui_force_apply_after_s):
+                last_ui_warn_ts = float(st.get("ui_last_stall_warn_ts") or 0.0)
+                if (now - last_ui_warn_ts) >= float(_conv_ui_stall_warn_cooldown_s):
+                    st["ui_last_stall_warn_ts"] = now
+                    st["ui_stall_count"] = int(st.get("ui_stall_count") or 0) + 1
+                    _append_status_log_locked(st, "[warn] UI heartbeat lag detected; forcing status refresh.")
+                    _conv_state_rev += 1
+                    trace_lines.append(
+                        "ui stall detected "
+                        + f"count={int(st.get('ui_stall_count') or 0)} lag={now - last_ui_apply_ts:.3f}s"
+                    )
 
         rev = int(_conv_state_rev)
         progress_val = _current_status_progress_locked(st)
-        log_text = None
-        if bool(st.get("log_dirty")) and (now - float(_conv_ui_last_log_push_ts)) >= float(_conv_status_log_ui_interval_s):
-            log_text = "\n".join(st.get("log_lines", []))
+        log_interval = (
+            float(_conv_status_log_ui_interval_convert_s)
+            if active and not done
+            else float(_conv_status_log_ui_interval_idle_s)
+        )
+        if bool(st.get("log_dirty")) and (now - float(_conv_ui_last_log_push_ts)) >= log_interval:
+            log_text_lines = list(st.get("log_lines", []))
             st["log_dirty"] = False
             _conv_ui_last_log_push_ts = now
 
-        return {
+        if active and not done and (now - float(_conv_trace_last_snapshot_log_ts)) >= 1.0:
+            trace_snapshot = (
+                "snapshot "
+                + f"rev={rev} active={active} done={done} "
+                + f"progress={progress_val:.4f} "
+                + f"last_event_age={now - float(st.get('last_event_ts') or 0.0):.3f}s "
+                + f"last_ui_apply_age={now - float(st.get('last_ui_apply_ts') or 0.0):.3f}s"
+            )
+            _conv_trace_last_snapshot_log_ts = now
+
+        snapshot = {
             "rev": rev,
-            "active": bool(st.get("active")),
-            "done": bool(st.get("done")),
+            "active": active,
+            "done": done,
             "success": bool(st.get("success")),
             "status_text": str(st.get("status_text") or ""),
+            "backend_text": str(st.get("backend_text") or ""),
             "progress": float(progress_val),
-            "log_text": log_text,
+            "log_text": None,
             "autoclose_pending": bool(st.get("autoclose_pending")),
             "preview_rebuild_pending": bool(st.get("preview_rebuild_pending")),
+            "ui_stall_count": int(st.get("ui_stall_count") or 0),
+            "last_ui_apply_ts": float(st.get("last_ui_apply_ts") or 0.0),
         }
+    if log_text_lines is not None:
+        snapshot["log_text"] = "\n".join(log_text_lines)
+    if trace_snapshot:
+        trace_lines.append(trace_snapshot)
+    for line in trace_lines:
+        _status_trace(line)
+    return snapshot
 
 def _clear_status_autoclose_pending():
     with _conv_state_lock:
@@ -2176,7 +2483,7 @@ def _clear_status_preview_rebuild_pending():
             st["preview_rebuild_pending"] = False
 
 def _apply_status_snapshot_to_ui(snapshot):
-    global _conv_success_autoclose_queued
+    global _conv_success_autoclose_queued, _conv_trace_last_ui_apply_log_ts
     if snapshot is None:
         return
     try:
@@ -2187,6 +2494,11 @@ def _apply_status_snapshot_to_ui(snapshot):
     try:
         if dpg.does_item_exist("conv_progress"):
             dpg.set_value("conv_progress", max(0.0, min(1.0, float(snapshot.get("progress", 0.0)))))
+    except Exception:
+        pass
+    try:
+        if dpg.does_item_exist("conv_backend_text") and dpg.get_value("conv_backend_text") != snapshot.get("backend_text", ""):
+            dpg.set_value("conv_backend_text", snapshot.get("backend_text", ""))
     except Exception:
         pass
     if snapshot.get("log_text") is not None:
@@ -2204,6 +2516,13 @@ def _apply_status_snapshot_to_ui(snapshot):
             dpg.configure_item("conv_close_button", show=True)
     except Exception:
         pass
+    now = time.monotonic()
+    if (now - float(_conv_trace_last_ui_apply_log_ts)) >= 1.0:
+        _status_trace(
+            f"ui apply rev={snapshot.get('rev')} progress={float(snapshot.get('progress', 0.0)):.4f} "
+            f"active={bool(snapshot.get('active'))} done={bool(snapshot.get('done'))}"
+        )
+        _conv_trace_last_ui_apply_log_ts = now
 
     if snapshot.get("preview_rebuild_pending"):
         rebuild_preview_work_image()
@@ -2218,21 +2537,6 @@ def _apply_status_snapshot_to_ui(snapshot):
 # ----------------------------
 # Converter queue & parsing (progress extraction, extended for batch)
 # ----------------------------
-def _append_to_conv_log(line):
-    _conv_log_lines.append(str(line))
-    _flush_conv_log(force=False)
-
-def _flush_conv_log(force=False):
-    global _conv_log_last_ui_push
-    now = time.monotonic()
-    if not force and (now - _conv_log_last_ui_push) < 0.08:
-        return
-    try:
-        dpg.set_value("conv_log", "\n".join(_conv_log_lines))
-        _conv_log_last_ui_push = now
-    except Exception:
-        pass
-
 def _parse_progress_from_line_batch(line):
     """
     Very small, robust parser for expected batch lines:
@@ -2274,6 +2578,18 @@ def _parse_progress_from_line_batch(line):
             return ("DURATION_MS", ms)
         except Exception:
             return ("LOG", line)
+    if line.startswith("BACKEND_REQUESTED:"):
+        try:
+            v = line.split(":",1)[1].strip()
+            return ("BACKEND_REQUESTED", v)
+        except Exception:
+            return ("LOG", line)
+    if line.startswith("COMPUTE_BACKEND_ACTIVE:"):
+        try:
+            v = line.split(":",1)[1].strip()
+            return ("COMPUTE_BACKEND_ACTIVE", v)
+        except Exception:
+            return ("LOG", line)
     if line.startswith("FFMPEG_PROGRESS:"):
         try:
             frac = float(line.split(":",1)[1].strip())
@@ -2300,53 +2616,6 @@ def _parse_progress_from_line_batch(line):
     # fallback
     return ("LOG", line)
 
-def _store_conv_duration_ms(v):
-    global _conv_duration_ms
-    try:
-        _conv_duration_ms = int(v)
-    except Exception:
-        _conv_duration_ms = None
-
-def _batch_progress_value():
-    if _conv_total_jobs and _conv_total_jobs > 0:
-        return max(0.0, min(1.0, float(_conv_done_jobs + _conv_current_job_stage) / float(_conv_total_jobs)))
-    return max(0.0, min(1.0, float(_conv_current_job_stage)))
-
-def _set_batch_progress():
-    try:
-        dpg.set_value("conv_progress", _batch_progress_value())
-    except Exception:
-        pass
-
-def _set_conv_status(text, force=False, min_interval=0.12):
-    global _conv_last_status_update
-    now = time.monotonic()
-    if not force and (now - _conv_last_status_update) < float(min_interval):
-        return
-    try:
-        if force or dpg.get_value("conv_status_text") != text:
-            dpg.set_value("conv_status_text", text)
-            _conv_last_status_update = now
-    except Exception:
-        pass
-
-def _refresh_current_job_stage():
-    global _conv_current_job_stage
-    # Status bar is frame-driven; encoding progress remains in logs only.
-    combined = float(_conv_job_frame_frac)
-    combined = max(0.0, min(1.0, combined))
-    _conv_current_job_stage = max(float(_conv_current_job_stage), combined)
-
-def _set_live_job_status():
-    job_no = int(_conv_current_job_index) + 1 if _conv_current_job_index is not None else "?"
-    total = _conv_total_jobs if _conv_total_jobs else "?"
-    if _conv_current_job_total:
-        frame_part = f"{_conv_current_job_processed}/{_conv_current_job_total}"
-    else:
-        frame_part = str(_conv_current_job_processed)
-    text = f"Job {job_no}/{total}: frames {frame_part}"
-    _set_conv_status(text, force=False)
-
 def _schedule_convert_modal_autoclose(delay_frames=75):
     def _hide_modal(sender=None, app_data=None, user_data=None):
         try:
@@ -2358,252 +2627,60 @@ def _schedule_convert_modal_autoclose(delay_frames=75):
     except Exception:
         pass
 
-def _finish_conversion_ui(code, error_message=None):
-    global _conv_queue, _conv_raw_queue, _conv_worker_thread, _conv_current_job_index, _conv_current_job_total, _conv_current_job_processed
-    global _conv_total_jobs, _conv_done_jobs, _conv_current_job_stage, _convert_tmpdir, _conv_duration_ms
-    global _conv_job_frame_frac, _conv_job_encode_frac, _conv_last_status_update, _conv_last_logged_processed
-    global _conv_state, _conv_state_rev, _conv_ui_applied_rev, _conv_success_autoclose_queued, _conv_render_last_heartbeat_ts
-    if code == 0 and not error_message:
-        _conv_done_jobs = max(_conv_done_jobs, _conv_total_jobs)
-        _conv_current_job_stage = 1.0
-        dpg.set_value("conv_progress", 1.0)
-        _set_conv_status("Conversion complete. Closing dialog...", force=True)
-        _append_to_conv_log("[done] conversion complete")
-        _flush_conv_log(force=True)
-        try:
-            dpg.configure_item("conv_cancel_button", show=False)
-            dpg.configure_item("conv_close_button", show=True)
-        except Exception:
-            pass
-        _schedule_convert_modal_autoclose()
-    else:
-        msg = error_message or f"Conversion finished with exit code {code}"
-        _set_conv_status("Conversion error", force=True)
-        _append_to_conv_log("[error] " + msg)
-        _flush_conv_log(force=True)
-        try:
-            dpg.configure_item("conv_cancel_button", show=False)
-            dpg.configure_item("conv_close_button", show=True)
-        except Exception:
-            pass
-    _cleanup_convert_tmpdir()
-    _conv_queue = None
-    _conv_raw_queue = None
-    _conv_worker_thread = None
-    _conv_current_job_index = None
-    _conv_current_job_total = None
-    _conv_current_job_processed = None
-    _conv_total_jobs = 0
-    _conv_done_jobs = 0
-    _conv_current_job_stage = 0.0
-    _conv_duration_ms = None
-    _conv_job_frame_frac = 0.0
-    _conv_job_encode_frac = 0.0
-    _conv_last_status_update = 0.0
-    _conv_last_logged_processed = 0
-    _conv_render_last_heartbeat_ts = 0.0
-    _conv_success_autoclose_queued = False
-    with _conv_state_lock:
-        _conv_state = None
-        _conv_state_rev = 0
-        _conv_ui_applied_rev = -1
-    rebuild_preview_work_image()
-    request_preview_update()
-
-def _poll_converter_queue(user_data=None):
-    global _conv_queue, _conv_current_job_index, _conv_current_job_total, _conv_current_job_processed
-    global _conv_total_jobs, _conv_done_jobs, _conv_current_job_stage, _conv_duration_ms
-    global _conv_job_frame_frac, _conv_job_encode_frac, _conv_last_logged_processed, _conv_poll_last_ts
-    global _conv_use_render_tick
-    if _conv_queue is None:
-        return
-    _conv_poll_last_ts = time.monotonic()
-    drained = 0
-    latest_processed = None
-    try:
-        while drained < _conv_poll_max_items:
-            try:
-                item = _conv_queue.get_nowait()
-            except queue.Empty:
-                break
-            drained += 1
-
-            try:
-                # structured items from thread
-                if isinstance(item, dict) and item.get("type") == "DONE":
-                    code = item.get("code", 0)
-                    _finish_conversion_ui(code=int(code) if code is not None else 1)
-                    return
-                if isinstance(item, dict) and item.get("type") == "ERROR":
-                    msg = item.get("message", "Unknown error")
-                    _finish_conversion_ui(code=1, error_message=msg)
-                    return
-                # otherwise item is a raw log line (string)
-                line = str(item)
-                # parse
-                kind, payload = _parse_progress_from_line_batch(line)
-                should_log_line = True
-                if kind == "PROCESSED":
-                    try:
-                        processed_now = int(payload)
-                    except Exception:
-                        processed_now = None
-                    if processed_now is not None:
-                        if (_conv_log_processed_step > 1) and (processed_now % _conv_log_processed_step != 0):
-                            should_log_line = False
-                        if processed_now > int(_conv_last_logged_processed or 0):
-                            _conv_last_logged_processed = processed_now
-                elif kind in {"FFMPEG_PROGRESS", "FFMPEG_KV"}:
-                    # Keep ffmpeg internals out of live log/status to avoid UI stalls.
-                    should_log_line = False
-
-                if should_log_line:
-                    _append_to_conv_log(line)
-
-                if kind == "JOB_START":
-                    _conv_current_job_index = payload.get("index")
-                    _conv_current_job_total = None
-                    _conv_current_job_processed = 0
-                    _conv_current_job_stage = 0.0
-                    _conv_job_frame_frac = 0.0
-                    _conv_job_encode_frac = 0.0
-                    _conv_last_logged_processed = 0
-                    latest_processed = None
-                    job_no = int(_conv_current_job_index) + 1 if _conv_current_job_index is not None else "?"
-                    total = _conv_total_jobs if _conv_total_jobs else "?"
-                    _set_conv_status(f"Job {job_no}/{total} started", force=True)
-                    _set_batch_progress()
-                elif kind == "TOTAL_FRAMES":
-                    _conv_current_job_total = int(payload)
-                    _set_live_job_status()
-                elif kind == "DURATION_MS":
-                    _store_conv_duration_ms(payload)
-                elif kind == "PROCESSED":
-                    try:
-                        p_now = int(payload)
-                    except Exception:
-                        p_now = None
-                    if p_now is not None:
-                        latest_processed = p_now if latest_processed is None else max(int(latest_processed), p_now)
-                elif kind == "FFMPEG_PROGRESS":
-                    # Ignored for status/progress; frame progress drives the UI.
-                    pass
-                elif kind == "JOB_DONE":
-                    idx = payload.get("index")
-                    code = payload.get("code")
-                    _conv_job_frame_frac = 1.0
-                    _conv_job_encode_frac = 1.0 if int(code or 0) == 0 else _conv_job_encode_frac
-                    _conv_current_job_stage = 1.0
-                    latest_processed = None
-                    if idx is not None:
-                        _conv_done_jobs = max(_conv_done_jobs, int(idx) + 1)
-                    elif _conv_total_jobs:
-                        _conv_done_jobs = min(_conv_total_jobs, _conv_done_jobs + 1)
-                    _conv_current_job_stage = 0.0
-                    _set_batch_progress()
-                    _set_conv_status(f"Job {idx} done (exit {code})", force=True)
-                    # continue waiting for next job or final DONE
-                elif kind == "BATCH_DONE":
-                    _conv_done_jobs = max(_conv_done_jobs, _conv_total_jobs)
-                    _conv_current_job_stage = 0.0
-                    _set_conv_status("Batch finished", force=True)
-                    dpg.set_value("conv_progress", 1.0)
-                    _append_to_conv_log("[batch done]")
-                    _flush_conv_log(force=True)
-                    # Hide cancel, show close
-                    try:
-                        dpg.configure_item("conv_cancel_button", show=False)
-                        dpg.configure_item("conv_close_button", show=True)
-                    except Exception:
-                        pass
-                elif kind == "FFMPEG_KV":
-                    k, v = payload
-                    if k == "duration_ms":
-                        _store_conv_duration_ms(v)
-                else:
-                    # generic log line — if it contains "Processed X/Y" try to parse and set progress
-                    m = re.search(r"Processed\s+(\d+)\s*/\s*(\d+)\s*frames", line, re.I)
-                    if m:
-                        got = int(m.group(1)); tot = int(m.group(2))
-                        if tot > 0:
-                            pv = max(0.0, min(1.0, float(got) / float(tot)))
-                            _conv_job_frame_frac = max(_conv_job_frame_frac, pv)
-                            _refresh_current_job_stage()
-                            _set_batch_progress()
-                            _set_live_job_status()
-            except Exception as e:
-                _append_to_conv_log(f"[warn] progress UI parse error: {e}")
-                continue
-
-        # Apply latest progress updates once per poll tick to avoid UI overload.
-        updated = False
-        if latest_processed is not None:
-            _conv_current_job_processed = int(latest_processed)
-            if _conv_current_job_total:
-                _conv_job_frame_frac = max(0.0, min(1.0, float(_conv_current_job_processed) / float(_conv_current_job_total)))
-            else:
-                _conv_job_frame_frac = min(1.0, _conv_job_frame_frac + 0.01)
-            updated = True
-        if updated:
-            _refresh_current_job_stage()
-            _set_batch_progress()
-            _set_live_job_status()
-    except Exception as e:
-        _append_to_conv_log(f"[warn] converter poll loop error: {e}")
-    finally:
-        if (not _conv_use_render_tick) and (_conv_queue is not None):
-            try:
-                dpg.set_frame_callback(dpg.get_frame_count() + _conv_poll_frame_step, _poll_converter_queue)
-            except Exception:
-                pass
-
-def _converter_render_tick(sender=None, app_data=None):
-    global _conv_render_last_heartbeat_ts, _conv_ui_applied_rev
-    now = time.monotonic()
-    if _conv_status_pipeline == "v2":
-        if (now - float(_conv_render_last_heartbeat_ts)) >= float(_conv_render_heartbeat_min_interval_s):
-            snap = _status_snapshot()
-            if snap is not None:
-                if int(snap.get("rev", -1)) != int(_conv_ui_applied_rev) or (snap.get("log_text") is not None):
-                    _apply_status_snapshot_to_ui(snap)
-                _conv_ui_applied_rev = max(int(_conv_ui_applied_rev), int(snap.get("rev", -1)))
-            _conv_render_last_heartbeat_ts = now
-        return
-    if _conv_queue is None:
-        return
-    if (now - float(_conv_poll_last_ts)) >= float(_conv_render_poll_min_interval_s):
-        _poll_converter_queue()
-
 def _ui_heartbeat(sender=None, app_data=None):
-    global _conv_ui_heartbeat_running, _conv_ui_applied_rev
+    global _conv_ui_heartbeat_running, _conv_ui_applied_rev, _conv_trace_last_ui_heartbeat_log_ts
+    global _conv_ui_last_heartbeat_ts, _conv_ui_heartbeat_seq
+    hb_start = time.monotonic()
+    _conv_ui_last_heartbeat_ts = hb_start
+    _conv_ui_heartbeat_seq += 1
+    hb_seq = int(_conv_ui_heartbeat_seq)
+    _status_note_ui_heartbeat(hb_seq)
+    if _conv_trace_enabled and _status_pipeline_active() and (hb_start - float(_conv_trace_last_ui_heartbeat_log_ts)) >= 1.0:
+        _status_trace("ui heartbeat")
+        _conv_trace_last_ui_heartbeat_log_ts = hb_start
     if _conv_ui_heartbeat_running:
-        try:
-            dpg.set_frame_callback(dpg.get_frame_count() + int(_ui_heartbeat_frame_step), _ui_heartbeat)
-        except Exception:
-            pass
+        if not _ui_manual_heartbeat_mode:
+            try:
+                dpg.set_frame_callback(dpg.get_frame_count() + int(_ui_heartbeat_frame_step), _ui_heartbeat)
+            except Exception as e:
+                _status_trace(f"ui heartbeat requeue (busy) failed: {e}")
+                pass
         return
     _conv_ui_heartbeat_running = True
     try:
-        if _conv_status_pipeline == "v2":
-            snapshot = _status_snapshot()
-            if snapshot is not None:
-                if int(snapshot.get("rev", -1)) != int(_conv_ui_applied_rev) or (snapshot.get("log_text") is not None):
-                    _apply_status_snapshot_to_ui(snapshot)
-                _conv_ui_applied_rev = max(int(_conv_ui_applied_rev), int(snapshot.get("rev", -1)))
-        else:
-            # Legacy v1 watchdog path.
-            if _conv_queue is not None:
-                now = time.monotonic()
-                if (now - float(_conv_poll_last_ts)) >= float(_ui_heartbeat_stale_poll_s):
-                    _poll_converter_queue()
-    except Exception:
-        pass
-    finally:
-        _conv_ui_heartbeat_running = False
+        snapshot = _status_snapshot()
+        if snapshot is not None:
+            do_apply = bool(snapshot.get("log_text") is not None) or int(snapshot.get("rev", -1)) != int(_conv_ui_applied_rev)
+            if (not do_apply) and bool(snapshot.get("active")) and not bool(snapshot.get("done")):
+                if _conv_ui_last_apply_ts > 0.0 and (time.monotonic() - float(_conv_ui_last_apply_ts)) > float(_conv_ui_force_apply_after_s):
+                    do_apply = True
+            if do_apply:
+                _apply_status_snapshot_to_ui(snapshot)
+                _status_note_ui_apply(hb_seq)
+            _conv_ui_applied_rev = max(int(_conv_ui_applied_rev), int(snapshot.get("rev", -1)))
+        if _preview_update_scheduled:
+            converting = _is_conversion_active()
+            budget_s = (
+                float(_ui_heartbeat_non_status_budget_s_convert)
+                if converting
+                else float(_ui_heartbeat_non_status_budget_s_idle)
+            )
+            if (time.monotonic() - hb_start) < budget_s:
+                _drain_preview_update()
+    except Exception as e:
+        _status_trace(f"ui heartbeat exception: {e}")
         try:
-            dpg.set_frame_callback(dpg.get_frame_count() + int(_ui_heartbeat_frame_step), _ui_heartbeat)
+            print(f"UI heartbeat exception: {e}", file=sys.stderr, flush=True)
         except Exception:
             pass
+    finally:
+        _conv_ui_heartbeat_running = False
+        if not _ui_manual_heartbeat_mode:
+            try:
+                dpg.set_frame_callback(dpg.get_frame_count() + int(_ui_heartbeat_frame_step), _ui_heartbeat)
+            except Exception as e:
+                _status_trace(f"ui heartbeat reschedule failed: {e}")
+                pass
 
 # ----------------------------
 # Cancel conversion
@@ -2611,20 +2688,13 @@ def _ui_heartbeat(sender=None, app_data=None):
 def _cancel_conversion_callback(sender=None, app_data=None):
     global _convert_proc, _convert_cancel_requested, _conv_state_rev
     _convert_cancel_requested = True
-    if _conv_status_pipeline == "v2":
-        with _conv_state_lock:
-            st = _conv_state
-            if st is not None:
-                _set_status_text_locked(st, "Cancel requested...")
-                _append_status_log_locked(st, "[user] cancel requested")
-                _conv_state_rev += 1
-    else:
-        try:
-            dpg.set_value("conv_status_text", "Cancel requested...")
-            _append_to_conv_log("[user] cancel requested")
-            dpg.configure_item("conv_cancel_button", show=False)
-        except Exception:
-            pass
+    _status_trace("cancel requested")
+    with _conv_state_lock:
+        st = _conv_state
+        if st is not None:
+            _set_status_text_locked(st, "Cancel requested...")
+            _append_status_log_locked(st, "[user] cancel requested")
+            _conv_state_rev += 1
     try:
         dpg.configure_item("conv_cancel_button", show=False)
     except Exception:
@@ -2639,10 +2709,7 @@ def _cancel_conversion_callback(sender=None, app_data=None):
                 pass
     def _force_stop():
         time.sleep(5.0)
-        if _conv_status_pipeline == "v2":
-            q = _conv_raw_queue
-        else:
-            q = _conv_queue
+        q = _conv_raw_queue
         if q is not None:
             _enqueue_status_event(q, {"type": "ERROR", "message": "Cancelled by user (timeout forced)."})
     threading.Thread(target=_force_stop, daemon=True).start()
@@ -2655,10 +2722,7 @@ def process_queue_and_spawn_batch(sender=None, app_data=None):
     Writes a batch.json describing the queued jobs and launches convert_clip.py --batch <batch.json>
     Streams output into the conversion modal.
     """
-    global queue_items, _conv_queue, _conv_raw_queue, _conv_worker_thread, _convert_thread, _convert_proc, _convert_tmpdir, _convert_cancel_requested
-    global _conv_total_jobs, _conv_done_jobs, _conv_current_job_stage, _conv_duration_ms
-    global _conv_job_frame_frac, _conv_job_encode_frac, _conv_last_status_update, _conv_log_last_ui_push
-    global _conv_last_logged_processed, _conv_poll_last_ts, _conv_use_render_tick, _conv_render_last_heartbeat_ts
+    global queue_items, _conv_raw_queue, _conv_worker_thread, _convert_thread, _convert_proc, _convert_tmpdir, _convert_cancel_requested
     global _conv_state, _conv_state_rev, _conv_ui_applied_rev, _conv_success_autoclose_queued
     if not queue_items:
         print("Queue empty — nothing to process.")
@@ -2706,12 +2770,16 @@ def process_queue_and_spawn_batch(sender=None, app_data=None):
         dpg.configure_item("conv_close_button", show=True)
         return
 
+    trace_path = _init_status_trace(total_jobs=len(jobs), cmd=cmd)
+    converter_trace_path = _conv_converter_trace_path
     print("Starting batch conversion:", " ".join(_shlex_quote(x) for x in cmd))
+    if trace_path:
+        print("Status trace log:", trace_path)
+    if converter_trace_path:
+        print("Converter trace log:", converter_trace_path)
 
     _convert_cancel_requested = False
     _conv_success_autoclose_queued = False
-    _conv_poll_last_ts = time.monotonic()
-    _conv_render_last_heartbeat_ts = 0.0
     rebuild_preview_work_image()
     request_preview_update()
     dpg.set_value("conv_log", "")
@@ -2721,144 +2789,88 @@ def process_queue_and_spawn_batch(sender=None, app_data=None):
         except Exception: pass
     dpg.show_item("convert_modal")
     try:
+        if trace_path or converter_trace_path:
+            dpg.set_value(
+                "conv_trace_path_text",
+                f"Status trace: {trace_path or 'disabled'} | Converter trace: {converter_trace_path or 'disabled'}",
+            )
+        else:
+            dpg.set_value("conv_trace_path_text", "Status trace: disabled")
+    except Exception:
+        pass
+    try:
         dpg.configure_item("conv_cancel_button", show=True)
         dpg.configure_item("conv_close_button", show=False)
     except Exception:
         pass
 
-    if _conv_status_pipeline == "v2":
-        # Initialize new status state pipeline.
-        _conv_queue = None
-        _conv_raw_queue = queue.Queue(maxsize=int(_conv_raw_queue_maxsize))
-        _init_conv_state(len(jobs))
-        snap = _status_snapshot()
-        if snap is not None:
-            _apply_status_snapshot_to_ui(snap)
-            _conv_ui_applied_rev = int(snap.get("rev", -1))
-        _conv_worker_thread = threading.Thread(target=_status_worker_loop, daemon=True)
-        _conv_worker_thread.start()
+    _conv_raw_queue = queue.Queue(maxsize=int(_conv_raw_queue_maxsize))
+    _init_conv_state(len(jobs))
+    snap = _status_snapshot()
+    if snap is not None:
+        _apply_status_snapshot_to_ui(snap)
+        _conv_ui_applied_rev = int(snap.get("rev", -1))
+    _conv_worker_thread = threading.Thread(target=_status_worker_loop, daemon=True)
+    _conv_worker_thread.start()
 
-        def _run_converter_v2():
-            global _convert_proc, _conv_raw_queue, _convert_cancel_requested
-            q = _conv_raw_queue
-            try:
-                _convert_proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    universal_newlines=True,
-                    bufsize=1,
-                )
-            except FileNotFoundError as e:
-                if q is not None:
-                    _enqueue_status_event(q, {"type": "ERROR", "message": f"Execution failed: {e}"})
-                return
-            except Exception as e:
-                if q is not None:
-                    _enqueue_status_event(q, {"type": "ERROR", "message": f"Failed to spawn converter: {e}"})
-                return
-
-            try:
-                if _convert_proc.stdout is not None:
-                    for raw in _convert_proc.stdout:
-                        if raw is None:
-                            continue
-                        _enqueue_status_line(q, raw)
-                        if _convert_cancel_requested:
-                            try:
-                                _convert_proc.terminate()
-                            except Exception:
-                                pass
-                code = _convert_proc.wait()
-                if q is not None:
-                    _enqueue_status_event(q, {"type": "DONE", "code": int(code)})
-            except Exception as e:
-                if q is not None:
-                    _enqueue_status_event(q, {"type": "ERROR", "message": str(e)})
-
-        _convert_thread = threading.Thread(target=_run_converter_v2, daemon=True)
-        _convert_thread.start()
-        _ui_heartbeat()
-        return
-
-    # Legacy v1 pipeline (rollback path)
-    _conv_queue = queue.Queue()
-    _conv_raw_queue = None
-    _conv_total_jobs = len(jobs)
-    _conv_done_jobs = 0
-    _conv_current_job_stage = 0.0
-    _conv_duration_ms = None
-    _conv_job_frame_frac = 0.0
-    _conv_job_encode_frac = 0.0
-    _conv_last_status_update = 0.0
-    _conv_last_logged_processed = 0
-    _conv_poll_last_ts = time.monotonic()
-    _conv_log_lines.clear()
-    _conv_log_last_ui_push = 0.0
-    _set_conv_status(f"Starting batch conversion ({_conv_total_jobs} jobs)...", force=True)
-
-    def _run_converter_v1():
-        global _convert_proc, _conv_queue, _convert_cancel_requested
+    def _run_converter_v2():
+        global _convert_proc, _conv_raw_queue, _convert_cancel_requested
+        q = _conv_raw_queue
+        _status_trace("converter thread start (v2)")
+        popen_env = os.environ.copy()
+        if converter_trace_path:
+            popen_env["PYCHROME_CONVERTER_TRACE"] = "1"
+            popen_env["PYCHROME_CONVERTER_TRACE_MODE"] = _conv_trace_mode
+            popen_env["PYCHROME_CONVERTER_TRACE_PATH"] = str(converter_trace_path)
+            _status_trace(f"converter trace enabled path={converter_trace_path}")
         try:
-            _convert_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
+            _convert_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                bufsize=1,
+                env=popen_env,
+            )
+            _status_trace(f"converter spawned pid={getattr(_convert_proc, 'pid', None)}")
         except FileNotFoundError as e:
-            try:
-                _conv_queue.put({"type": "ERROR", "message": f"Execution failed: {e}"})
-            except Exception:
-                pass
+            _status_trace(f"converter spawn file-not-found: {e}")
+            if q is not None:
+                _enqueue_status_event(q, {"type": "ERROR", "message": f"Execution failed: {e}"})
             return
         except Exception as e:
-            try:
-                _conv_queue.put({"type": "ERROR", "message": f"Failed to spawn converter: {e}"})
-            except Exception:
-                pass
+            _status_trace(f"converter spawn failed: {e}")
+            if q is not None:
+                _enqueue_status_event(q, {"type": "ERROR", "message": f"Failed to spawn converter: {e}"})
             return
+
         try:
+            raw_line_count = 0
             if _convert_proc.stdout is not None:
-                last_ffmpeg_progress = None
                 for raw in _convert_proc.stdout:
                     if raw is None:
                         continue
-                    line = raw.rstrip("\n")
-                    if line.startswith("JOB_START:"):
-                        last_ffmpeg_progress = None
-                    if line.startswith("FFMPEG_PROGRESS:"):
-                        try:
-                            frac = float(line.split(":", 1)[1].strip())
-                            if last_ffmpeg_progress is not None and frac <= (last_ffmpeg_progress + 1e-6):
-                                continue
-                            last_ffmpeg_progress = frac
-                        except Exception:
-                            pass
-                    try:
-                        _conv_queue.put(line)
-                    except Exception:
-                        pass
+                    raw_line_count += 1
+                    if raw_line_count % 200 == 0:
+                        _status_trace(f"converter stdout lines={raw_line_count}")
+                    _enqueue_status_line(q, raw)
                     if _convert_cancel_requested:
                         try:
                             _convert_proc.terminate()
                         except Exception:
                             pass
             code = _convert_proc.wait()
-            try:
-                _conv_queue.put({"type": "DONE", "code": int(code)})
-            except Exception:
-                pass
+            _status_trace(f"converter exit code={int(code)} lines={raw_line_count}")
+            if q is not None:
+                _enqueue_status_event(q, {"type": "DONE", "code": int(code)})
         except Exception as e:
-            try:
-                _conv_queue.put({"type": "ERROR", "message": str(e)})
-            except Exception:
-                pass
+            _status_trace(f"converter thread exception: {e}")
+            if q is not None:
+                _enqueue_status_event(q, {"type": "ERROR", "message": str(e)})
 
-    _convert_thread = threading.Thread(target=_run_converter_v1, daemon=True)
+    _convert_thread = threading.Thread(target=_run_converter_v2, daemon=True)
     _convert_thread.start()
-    if _conv_use_render_tick:
-        _poll_converter_queue()
-    else:
-        try:
-            dpg.set_frame_callback(dpg.get_frame_count() + _conv_poll_frame_step, _poll_converter_queue)
-        except Exception:
-            pass
+    _ui_heartbeat()
 
 def _shlex_quote(s):
     return '"' + str(s).replace('"', '\\"') + '"'
@@ -3122,6 +3134,8 @@ with dpg.window(label="Preset exists", modal=True, show=False, tag="overwrite_pr
 # Conversion modal: progress + log + cancel
 with dpg.window(label="Conversion progress", modal=True, show=False, tag="convert_modal", no_title_bar=False, width=720, height=520):
     dpg.add_text("Conversion status", tag="conv_status_text")
+    dpg.add_text("Backend: Requested=pending | Active=pending", tag="conv_backend_text")
+    dpg.add_text("Status trace: disabled", tag="conv_trace_path_text", wrap=700)
     dpg.add_spacer(height=6)
     dpg.add_progress_bar(tag="conv_progress", default_value=0.0, width=-1)
     dpg.add_spacer(height=6)
@@ -3134,11 +3148,6 @@ with dpg.window(label="Conversion progress", modal=True, show=False, tag="conver
 # Setup viewport and run
 dpg.create_viewport(title="Py-Chrome (Video)", width=1300, height=850)
 dpg.setup_dearpygui()
-try:
-    _conv_use_render_tick = True
-    dpg.set_render_callback(_converter_render_tick)
-except Exception:
-    _conv_use_render_tick = False
 _schedule_ui_heartbeat()
 
 with dpg.handler_registry():
@@ -3153,6 +3162,9 @@ _set_lut_status()
 _set_compute_status()
 set_scope_mode(_scope_mode)
 dpg.show_viewport()
-dpg.start_dearpygui()
+# Manual render loop: keeps status/preview heartbeat deterministic even when frame-callback chains are dropped.
+while dpg.is_dearpygui_running():
+    _ui_heartbeat()
+    dpg.render_dearpygui_frame()
 _reset_preview_processor()
 dpg.destroy_context()
